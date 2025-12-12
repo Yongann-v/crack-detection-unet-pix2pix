@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    # Declare launch arguments
+    model_path_arg = DeclareLaunchArgument(
+        'model_path',
+        default_value='models/best_model.pth',
+        description='Path to trained UNet model'
+    )
+    
+    pix2pix_model_path_arg = DeclareLaunchArgument(
+        'pix2pix_model_path',
+        default_value='models/pix2pix_epoch_98_best.pth',
+        description='Path to trained Pix2Pix model'
+    )
+    
+    use_tiling_arg = DeclareLaunchArgument(
+        'use_tiling',
+        default_value='false',
+        description='Use tiled inference (slower but more accurate)'
+    )
+    
+    use_pix2pix_arg = DeclareLaunchArgument(
+        'use_pix2pix',
+        default_value='false',
+        description='Use Pix2Pix refinement (better quality)'
+    )
+    
+    threshold_arg = DeclareLaunchArgument(
+        'threshold',
+        default_value='0.5',
+        description='Detection threshold (0.0-1.0)'
+    )
+    
+    min_crack_percent_arg = DeclareLaunchArgument(
+        'min_crack_percent',
+        default_value='5.0',
+        description='Minimum crack percentage to trigger detection'
+    )
+    
+    skip_frames_arg = DeclareLaunchArgument(
+        'skip_frames',
+        default_value='1',
+        description='Process every Nth frame (1=all frames)'
+    )
+    
+    camera_topic_arg = DeclareLaunchArgument(
+        'camera_topic',
+        default_value='/a200_1103/sensors/camera_0/color/image',
+        description='Camera image topic to subscribe to'
+    )
+    
+    # ADD THESE NEW ZOOM ARGUMENTS
+    zoom_enabled_arg = DeclareLaunchArgument(
+        'zoom_enabled',
+        default_value='false',
+        description='Enable zoom feature'
+    )
+    
+    zoom_factor_arg = DeclareLaunchArgument(
+        'zoom_factor',
+        default_value='2.0',
+        description='Zoom magnification factor'
+    )
+    
+    zoom_center_x_arg = DeclareLaunchArgument(
+        'zoom_center_x',
+        default_value='0.5',
+        description='Horizontal zoom center (0.0-1.0)'
+    )
+    
+    zoom_center_y_arg = DeclareLaunchArgument(
+        'zoom_center_y',
+        default_value='0.5',
+        description='Vertical zoom center (0.0-1.0)'
+    )
+    
+    save_directory_arg = DeclareLaunchArgument(
+        'save_directory',
+        default_value='crack_captures',
+        description='Directory to save captured images'
+    )
+    
+    # Create the crack detection node
+    crack_detection_node = Node(
+        package='crack_detection',
+        executable='crack_detection_node',
+        name='crack_detection_node',
+        output='screen',
+        parameters=[{
+            'model_path': LaunchConfiguration('model_path'),
+            'pix2pix_model_path': LaunchConfiguration('pix2pix_model_path'),
+            'use_tiling': LaunchConfiguration('use_tiling'),
+            'use_pix2pix': LaunchConfiguration('use_pix2pix'),
+            'threshold': LaunchConfiguration('threshold'),
+            'min_crack_percent': LaunchConfiguration('min_crack_percent'),
+            'skip_frames': LaunchConfiguration('skip_frames'),
+            'camera_topic': LaunchConfiguration('camera_topic'),
+            'input_size': 384,
+            'window_size': 384,
+            'subdivisions': 2,
+            'publish_visualization': True,
+            # ADD THESE NEW PARAMETERS
+            'zoom_enabled': LaunchConfiguration('zoom_enabled'),
+            'zoom_factor': LaunchConfiguration('zoom_factor'),
+            'zoom_center_x': LaunchConfiguration('zoom_center_x'),
+            'zoom_center_y': LaunchConfiguration('zoom_center_y'),
+            'save_directory': LaunchConfiguration('save_directory'),
+            'capture_key_topic': '/capture_image',
+        }]
+    )
+    
+    return LaunchDescription([
+        model_path_arg,
+        pix2pix_model_path_arg,
+        use_tiling_arg,
+        use_pix2pix_arg,
+        threshold_arg,
+        min_crack_percent_arg,
+        skip_frames_arg,
+        camera_topic_arg,
+        # ADD THESE TO THE LAUNCH DESCRIPTION
+        zoom_enabled_arg,
+        zoom_factor_arg,
+        zoom_center_x_arg,
+        zoom_center_y_arg,
+        save_directory_arg,
+        crack_detection_node
+    ])

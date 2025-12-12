@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+
+import os
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String, Bool
+from geometry_msgs.msg import Point
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+import torch
+import gc
+from collections import deque
+import time
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from ament_index_python.packages import get_package_share_directory
+
+# Import your models
+from crack_detection.unet_model import UNet
+from crack_detection.train_pix2pix import Generator
+from crack_detection.unet_rt_inference_tiling6 import TiledUNetInference
+from crack_detection.pix2pix_rt_inference_tiling import TiledRefinedInference
+
+
+class CrackDetectionNode(Node):
+    """ROS2 node for crack detection with UNet and Pix2Pix support."""
+    
+    def __init__(self):
+        super().__init__('crack_detection_node')
+        
+        # Declare ROS2 parameters
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('model_path', 'models/best_model.pth'),
+                ('pix2pix_model_path', 'models/pix2pix_epoch_98_best.pth'),
+                ('input_size', 384),
+                ('threshold', 0.5),
+                ('min_crack_percent', 5.0),
+                ('use_tiling', False),
+                ('use_pix2pix', False),
+                ('window_size', 384),
+                ('subdivisions', 2),
+                ('skip_frames', 1),
+                ('camera_topic', '/camera/color/image_raw'),
+                ('publish_visualization', True),
+            ]
+        )
+        
+        # Get parameters
+        model_path_param = self.get_parameter('model_path').value
+        pix2pix_path_param = self.get_parameter('pix2pix_model_path').value
+        
+        # Convert relative paths to absolute using package share directory
+        if not os.path.isabs(model_path_param):
+            package_share = get_package_share_directory('crack_detection')
+            self.model_path = os.path.join(package_share, model_path_param)
+        else:
+            self.model_path = model_path_param
+            
+        if not os.path.isabs(pix2pix_path_param):
+            package_share = get_package_share_directory('crack_detection')
+            self.pix2pix_model_path = os.path.join(package_share, pix2pix_path_param)
+        else:
+            self.pix2pix_model_path = pix2pix_path_param
+        
+        self.input_size = self.get_parameter('input_size').value
+        self.threshold = self.get_parameter('threshold').value
+        self.min_crack_percent = self.get_parameter('min_crack_percent').value
+        self.use_tiling = self.get_parameter('use_tiling').value
+        self.use_pix2pix = self.get_parameter('use_pix2pix').value
+        self.window_size = self.get_parameter('window_size').value
+        self.subdivisions = self.get_parameter('subdivisions').value
+        self.skip_frames = self.get_parameter('skip_frames').value
+        self.camera_topic = self.get_parameter('camera_topic').value
+        self.publish_visualization = self.get_parameter('publish_visualization').value
+        
+        self.get_logger().info('='*60)
+        self.get_logger().info('Crack Detection Node Initializing...')
+        self.get_logger().info('='*60)
+        self.get_logger().info(f'UNet model path: {self.model_path}')
+        if self.use_pix2pix:
+            self.get_logger().info(f'Pix2Pix model path: {self.pix2pix_model_path}')
+        self.get_logger().info(f'Detection threshold: {self.threshold}')
+        self.get_logger().info(f'Minimum crack %: {self.min_crack_percent}%')
+        self.get_logger().info(f'Frame skipping: Process every {self.skip_frames} frame(s)')
+        self.get_logger().info(f'Camera topic: {self.camera_topic}')
+        
+        # Setup device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.get_logger().info(f'Device: {self.device}')
+        
+        # Determine mode and initialize appropriate models
+        self.determine_and_initialize_mode()
+        
+        # Initialize CV Bridge
+        self.bridge = CvBridge()
+        
+        # Frame counting and caching
+        self.frame_count = 0
+        self.last_pred_prob = None
+        self.last_binary_mask = None
+        self.last_crack_percentage = 0.0
+        
+        # FPS tracking
+        self.fps_queue = deque(maxlen=30)
+        self.last_time = time.time()
+        
+        # Create subscribers
+        self.image_sub = self.create_subscription(
+            Image,
+            self.camera_topic,
+            self.image_callback,
+            10
+        )
+        
+        # Create publishers
+        self.detection_pub = self.create_publisher(
+            String,
+            '/crack_detection/result',
+            10
+        )
+        
+        self.crack_detected_pub = self.create_publisher(
+            Bool,
+            '/crack_detection/detected',
+            10
+        )
+        
+        self.crack_center_pub = self.create_publisher(
+            Point,
+            '/crack_detection/center_pixel',
+            10
+        )
+        
+        if self.publish_visualization:
+            self.viz_pub = self.create_publisher(
+                Image,
+                '/crack_detection/visualization',
+                10
+            )
+        
+        self.get_logger().info('✓ Initialization complete!')
+        self.get_logger().info('Waiting for camera images...')
+        self.get_logger().info('='*60)
+    
+    def determine_and_initialize_mode(self):
+        """Determine which inference mode to use and initialize models."""
+        
+        if self.use_tiling and self.use_pix2pix:
+            # Mode 4: UNet + Pix2Pix Tiled (Best Quality)
+            self.mode = "UNET_PIX2PIX_TILED"
+            self.get_logger().info(f'Mode: UNet + Pix2Pix TILED (Best Quality)')
+            self.get_logger().info(f'Window size: {self.window_size}x{self.window_size}')
+            self.get_logger().info(f'Subdivisions: {self.subdivisions}')
+            
+            self.tiled_refined_inferencer = TiledRefinedInference(
+                unet_path=self.model_path,
+                pix2pix_path=self.pix2pix_model_path,
+                device=self.device,
+                window_size=self.window_size,
+                subdivisions=self.subdivisions
+            )
+            self.model = None
+            self.pix2pix = None
+            self.transforms = None
+            self.tiled_inferencer = None
+            
+        elif self.use_tiling and not self.use_pix2pix:
+            # Mode 2: UNet Tiled Only
+            self.mode = "UNET_TILED"
+            self.get_logger().info(f'Mode: UNet TILED (High Accuracy)')
+            self.get_logger().info(f'Window size: {self.window_size}x{self.window_size}')
+            self.get_logger().info(f'Subdivisions: {self.subdivisions}')
+            
+            self.tiled_inferencer = TiledUNetInference(
+                model_path=self.model_path,
+                device=self.device,
+                window_size=self.window_size,
+                subdivisions=self.subdivisions
+            )
+            self.model = None
+            self.pix2pix = None
+            self.transforms = None
+            self.tiled_refined_inferencer = None
+            
+        elif not self.use_tiling and self.use_pix2pix:
+            # Mode 3: UNet + Pix2Pix Fast
+            self.mode = "UNET_PIX2PIX_FAST"
+            self.get_logger().info(f'Mode: UNet + Pix2Pix FAST (Better Quality)')
+            self.get_logger().info(f'Input size: {self.input_size}x{self.input_size}')
+            
+            self.model, self.pix2pix = self.load_both_models()
+            self.transforms = self.get_inference_transforms()
+            self.tiled_inferencer = None
+            self.tiled_refined_inferencer = None
+            
+        else:
+            # Mode 1: UNet Fast Only (Default)
+            self.mode = "UNET_FAST"
+            self.get_logger().info(f'Mode: UNet FAST (Real-time)')
+            self.get_logger().info(f'Input size: {self.input_size}x{self.input_size}')
+            
+            self.model = self.load_unet_model()
+            self.pix2pix = None
+            self.transforms = self.get_inference_transforms()
+            self.tiled_inferencer = None
+            self.tiled_refined_inferencer = None
+    
+    def load_unet_model(self):
+        """Load UNet model only."""
+        self.get_logger().info(f'Loading UNet from: {self.model_path}')
+        
+        model = UNet(
+            num_classes=1,
+            align_corners=False,
+            use_deconv=False,
+            in_channels=3
+        ).to(self.device)
+        
+        checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        
+        self.get_logger().info('✓ UNet loaded successfully!')
+        return model
+    
+    def load_both_models(self):
+        """Load both UNet and Pix2Pix models."""
+        self.get_logger().info(f'Loading UNet from: {self.model_path}')
+        
+        # Load UNet
+        unet = UNet(
+            num_classes=1,
+            align_corners=False,
+            use_deconv=False,
+            in_channels=3
+        ).to(self.device)
+        
+        unet_checkpoint = torch.load(self.model_path, map_location=self.device, weights_only=False)
+        unet.load_state_dict(unet_checkpoint['model_state_dict'])
+        unet.eval()
+        
+        self.get_logger().info(f'Loading Pix2Pix from: {self.pix2pix_model_path}')
+        
+        # Load Pix2Pix
+        pix2pix = Generator().to(self.device)
+        
+        pix2pix_checkpoint = torch.load(self.pix2pix_model_path, map_location=self.device, weights_only=False)
+        pix2pix.load_state_dict(pix2pix_checkpoint['generator_state_dict'])
+        pix2pix.eval()
+        
+        self.get_logger().info('✓ Both models loaded successfully!')
+        return unet, pix2pix
+    
+    def get_inference_transforms(self):
+        """Get transforms for inference."""
+        return A.Compose([
+            A.Resize(self.input_size, self.input_size),
+            A.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            ToTensorV2()
+        ])
+    
+    def predict_frame_unet_fast(self, frame_rgb):
+        """Mode 1: Fast UNet prediction."""
+        original_size = frame_rgb.shape[:2]
+        
+        # Apply transforms
+        transformed = self.transforms(image=frame_rgb)
+        input_tensor = transformed['image'].unsqueeze(0).to(self.device)
+        
+        # Predict
+        with torch.no_grad():
+            output = self.model(input_tensor)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            
+            prediction = torch.sigmoid(output)
+            
+            # Resize back to original size
+            pred_resized = torch.nn.functional.interpolate(
+                prediction,
+                size=original_size,
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Convert to numpy
+            pred_numpy = pred_resized.squeeze().cpu().numpy()
+            
+            # Apply threshold
+            binary_mask = (pred_numpy > self.threshold).astype(np.uint8) * 255
+        
+        # Calculate crack percentage
+        crack_pixels = np.sum(binary_mask > 127)
+        total_pixels = binary_mask.size
+        crack_percentage = (crack_pixels / total_pixels) * 100
+        
+        return pred_numpy, binary_mask, crack_percentage
+    
+    def predict_frame_unet_tiled(self, frame_rgb):
+        """Mode 2: Tiled UNet prediction."""
+        original_size = frame_rgb.shape[:2]
+        
+        # Pad image
+        padded = self.tiled_inferencer._pad_img(frame_rgb)
+        padded_shape = list(padded.shape[:-1]) + [1]
+        
+        # Process with tiling
+        subdivs = self.tiled_inferencer._windowed_subdivs(padded)
+        predictions = self.tiled_inferencer._recreate_from_subdivs(subdivs, padded_shape)
+        
+        # Unpad
+        predictions = self.tiled_inferencer._unpad_img(predictions)
+        
+        # Crop to original size
+        pred_numpy = predictions[:original_size[0], :original_size[1], 0]
+        
+        # Apply threshold
+        binary_mask = (pred_numpy > self.threshold).astype(np.uint8) * 255
+        
+        # Calculate crack percentage
+        crack_pixels = np.sum(binary_mask > 127)
+        total_pixels = binary_mask.size
+        crack_percentage = (crack_pixels / total_pixels) * 100
+        
+        # Cleanup
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return pred_numpy, binary_mask, crack_percentage
+    
+    def predict_frame_pix2pix_fast(self, frame_rgb):
+        """Mode 3: Fast UNet + Pix2Pix prediction."""
+        original_size = frame_rgb.shape[:2]
+        
+        # Apply transforms
+        transformed = self.transforms(image=frame_rgb)
+        input_tensor = transformed['image'].unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            # Stage 1: UNet prediction
+            unet_output = self.model(input_tensor)
+            if isinstance(unet_output, (tuple, list)):
+                unet_output = unet_output[0]
+            unet_pred = torch.sigmoid(unet_output)
+            
+            # Stage 2: Pix2Pix residual refinement
+            residual = self.pix2pix(unet_pred)
+            
+            # Stage 3: Combine predictions
+            refined_pred = torch.clamp(unet_pred + residual, 0, 1)
+            
+            # Resize back to original size
+            pred_resized = torch.nn.functional.interpolate(
+                refined_pred,
+                size=original_size,
+                mode='bilinear',
+                align_corners=False
+            )
+            
+            # Convert to numpy
+            pred_numpy = pred_resized.squeeze().cpu().numpy()
+            
+            # Apply threshold
+            binary_mask = (pred_numpy > self.threshold).astype(np.uint8) * 255
+        
+        # Calculate crack percentage
+        crack_pixels = np.sum(binary_mask > 127)
+        total_pixels = binary_mask.size
+        crack_percentage = (crack_pixels / total_pixels) * 100
+        
+        return pred_numpy, binary_mask, crack_percentage
+    
+    def predict_frame_pix2pix_tiled(self, frame_rgb):
+        """Mode 4: Tiled UNet + Pix2Pix prediction."""
+        original_size = frame_rgb.shape[:2]
+        
+        # Pad image
+        padded = self.tiled_refined_inferencer._pad_img(frame_rgb)
+        padded_shape = list(padded.shape[:-1]) + [1]
+        
+        # Process with tiling + Pix2Pix
+        subdivs = self.tiled_refined_inferencer._windowed_subdivs(padded)
+        predictions = self.tiled_refined_inferencer._recreate_from_subdivs(subdivs, padded_shape)
+        
+        # Unpad
+        predictions = self.tiled_refined_inferencer._unpad_img(predictions)
+        
+        # Crop to original size
+        pred_numpy = predictions[:original_size[0], :original_size[1], 0]
+        
+        # Apply threshold
+        binary_mask = (pred_numpy > self.threshold).astype(np.uint8) * 255
+        
+        # Calculate crack percentage
+        crack_pixels = np.sum(binary_mask > 127)
+        total_pixels = binary_mask.size
+        crack_percentage = (crack_pixels / total_pixels) * 100
+        
+        # Cleanup
+        gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return pred_numpy, binary_mask, crack_percentage
+    
+    def predict_frame(self, frame_rgb):
+        """Route to appropriate prediction method based on mode."""
+        if self.mode == "UNET_FAST":
+            return self.predict_frame_unet_fast(frame_rgb)
+        elif self.mode == "UNET_TILED":
+            return self.predict_frame_unet_tiled(frame_rgb)
+        elif self.mode == "UNET_PIX2PIX_FAST":
+            return self.predict_frame_pix2pix_fast(frame_rgb)
+        elif self.mode == "UNET_PIX2PIX_TILED":
+            return self.predict_frame_pix2pix_tiled(frame_rgb)
+    
+    def calculate_crack_center(self, binary_mask):
+        """Calculate the center point of detected cracks."""
+        crack_pixels = np.where(binary_mask > 127)
+        
+        if len(crack_pixels[0]) > 0:
+            center_y = int(np.mean(crack_pixels[0]))
+            center_x = int(np.mean(crack_pixels[1]))
+            return center_x, center_y
+        else:
+            return 0, 0
+    
+    def create_visualization(self, frame_bgr, pred_prob, binary_mask, crack_percentage, is_crack_detected):
+        """Create visualization with heatmap and overlay."""
+        # Create heatmap
+        heatmap = (pred_prob * 255).astype(np.uint8)
+        heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        
+        # Create crack overlay
+        overlay = frame_bgr.copy()
+        crack_pixels = binary_mask > 127
+        overlay[crack_pixels] = [0, 0, 255]  # Red for cracks
+        blended = cv2.addWeighted(frame_bgr, 0.7, overlay, 0.3, 0)
+        
+        # Stack horizontally
+        combined = np.hstack([frame_bgr, heatmap_colored, blended])
+        
+        # Add info panel
+        panel_height = 60
+        info_panel = np.zeros((panel_height, combined.shape[1], 3), dtype=np.uint8)
+        
+        # FPS
+        fps = self.calculate_fps()
+        cv2.putText(info_panel, f"FPS: {fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Crack percentage
+        cv2.putText(info_panel, f"Crack: {crack_percentage:.2f}%", (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        # Detection status
+        if is_crack_detected:
+            status_text = "CRACK DETECTED"
+            status_color = (0, 0, 255)  # Red
+        else:
+            status_text = "NO CRACK"
+            status_color = (0, 255, 0)  # Green
+        
+        text_x = combined.shape[1] - 240
+        cv2.putText(info_panel, status_text, (text_x, 38),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+        
+        # Combine with info panel
+        result = np.vstack([info_panel, combined])
+        
+        return result
+    
+    def calculate_fps(self):
+        """Calculate current FPS."""
+        current_time = time.time()
+        time_diff = current_time - self.last_time
+        self.last_time = current_time
+        
+        if time_diff > 0:
+            fps = 1.0 / time_diff
+            self.fps_queue.append(fps)
+        
+        return np.mean(self.fps_queue) if len(self.fps_queue) > 0 else 0.0
+    
+    def image_callback(self, msg):
+        """Callback function for incoming camera images."""
+        self.frame_count += 1
+        
+        # Convert ROS Image to OpenCV
+        try:
+            frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert image: {e}')
+            return
+        
+        # Convert BGR to RGB for model
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        
+        # Check if we should process this frame
+        if self.frame_count % self.skip_frames == 1 or self.skip_frames == 1:
+            # Run inference
+            pred_prob, binary_mask, crack_percentage = self.predict_frame(frame_rgb)
+            
+            # Cache results
+            self.last_pred_prob = pred_prob
+            self.last_binary_mask = binary_mask
+            self.last_crack_percentage = crack_percentage
+        else:
+            # Use cached results
+            pred_prob = self.last_pred_prob
+            binary_mask = self.last_binary_mask
+            crack_percentage = self.last_crack_percentage
+        
+        # Determine if crack detected
+        is_crack_detected = crack_percentage >= self.min_crack_percent
+        
+        # Calculate crack center
+        center_x, center_y = self.calculate_crack_center(binary_mask)
+        
+        # Print detection result
+        if is_crack_detected:
+            self.get_logger().info(
+                f'🔴 CRACK DETECTED at pixel ({center_x}, {center_y}) | '
+                f'Coverage: {crack_percentage:.2f}% | Frame: {self.frame_count}'
+            )
+        
+        # Publish detection result
+        result_msg = String()
+        result_msg.data = f'detected={is_crack_detected},crack_percent={crack_percentage:.2f},center_x={center_x},center_y={center_y},frame={self.frame_count}'
+        self.detection_pub.publish(result_msg)
+        
+        # Publish boolean detection
+        detected_msg = Bool()
+        detected_msg.data = bool(is_crack_detected)
+        self.crack_detected_pub.publish(detected_msg)
+        
+        # Publish crack center
+        if is_crack_detected:
+            center_msg = Point()
+            center_msg.x = float(center_x)
+            center_msg.y = float(center_y)
+            center_msg.z = 0.0
+            self.crack_center_pub.publish(center_msg)
+        
+        # Publish visualization
+        if self.publish_visualization:
+            viz_image = self.create_visualization(
+                frame_bgr, pred_prob, binary_mask, crack_percentage, is_crack_detected
+            )
+            
+            try:
+                viz_msg = self.bridge.cv2_to_imgmsg(viz_image, encoding='bgr8')
+                viz_msg.header = msg.header
+                self.viz_pub.publish(viz_msg)
+            except Exception as e:
+                self.get_logger().error(f'Failed to publish visualization: {e}')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    
+    node = CrackDetectionNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('Shutting down crack detection node...')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,41 @@
+# Crack Detection Node Parameters
+
+crack_detection_node:
+  ros__parameters:
+    # Model configuration
+    model_path: "models/best_model.pth"
+    pix2pix_model_path: "models/pix2pix_epoch_98_best.pth"
+    
+    # Inference settings
+    input_size: 384                # Input size for fast mode (256, 384, 512)
+    threshold: 0.5                 # Binary threshold (0.0-1.0)
+    min_crack_percent: 5.0         # Minimum crack % to trigger detection
+    
+    # Mode selection
+    use_tiling: false              # Enable tiled inference
+    use_pix2pix: false             # Enable Pix2Pix refinement
+    
+    # Tiling configuration
+    window_size: 384               # Tile size for tiling mode
+    subdivisions: 2                # Overlap factor (2=50%, 4=75%)
+    
+    # Zoom settings
+    zoom_enabled: false            # Enable zoom feature
+    zoom_factor: 2.0              # Zoom magnification (1.0 = no zoom, 2.0 = 2x)
+    zoom_center_x: 0.5            # Horizontal center (0.0-1.0, 0.5 = center)
+    zoom_center_y: 0.5            # Vertical center (0.0-1.0, 0.5 = center)
+    
+    # Capture settings
+    save_directory: "crack_captures"     # Directory to save captured images
+    capture_key_topic: "/capture_image"  # Topic to trigger image capture
+    
+    # Performance settings
+    skip_frames: 1                 # Process every Nth frame (1=all frames)
+    
+    # ROS topics
+    camera_topic: "/a200_1103/sensors/camera_0/color/image"
+    publish_visualization: true
+    
+    #temporal settings
+    temporal_window_size: 3
+    temporal_threshold: 3
