@@ -8,7 +8,7 @@ This repository contains a ROS2 package for crack detection using a UNet+Pix2Pix
 Make sure you have:
 
 - ROS2 installed
-- - RealSense2 ROS package ([`realsense2_camera`](https://github.com/IntelRealSense/realsense-ros)) installed  
+- RealSense2 ROS package ([`realsense2_camera`](https://github.com/IntelRealSense/realsense-ros)) installed  
 - Git LFS is installed before cloning. Large model files are handled via Git LFS.
 - Your Python environment configured for the crack detection model
 ---
@@ -81,7 +81,6 @@ ros2 launch crack_detection crack_detection.launch.py \
   zoom_enabled:=true \
   zoom_factor:=1.5
 ```
-This launches RViz in the background with the specified camera topics.
 ---
 
 ## **View Images with rqt_image_view**
@@ -91,7 +90,6 @@ To inspect the visualization output:
 ```bash
 ros2 run rqt_image_view rqt_image_view /crack_detection/visualization
 ```
-This opens a GUI to view processed images from the crack detection node.
 ---
 
 
