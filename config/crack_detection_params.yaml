@@ -32,9 +32,11 @@ crack_detection_node:
     skip_frames: 1                 # Process every Nth frame (1=all frames)
     
     # ROS topics
-    camera_topic: "/a200_1103/sensors/camera_0/color/image"
+    camera_topic: "/insta360/front/image_raw"   # Insta360 ONE R (bottom half of dual-fisheye)
     depth_topic: "/a200_1103/sensors/camera_0/depth/image"    # ADD THIS
     publish_visualization: true
+    viz_scale: 0.5                 # Downscale published visualization (1.0 = full size)
+    use_fp16: true                 # Half-precision inference on GPU (~2x faster UNet)
     
     # Temporal consistency settings
     temporal_window_size: 5        # Number of frames to check (increased from 3 for moving platform)
@@ -46,7 +48,7 @@ crack_detection_node:
     hysteresis_min_duration: 0.5          # Minimum detection duration in seconds
     
     # Depth filtering settings - ADD THIS SECTION
-    depth_filtering_enabled: true         # Enable depth-based filtering (KEY for building structures!)
+    depth_filtering_enabled: false        # Insta360 has no depth camera
     use_adaptive_depth: true              # Auto-adapt to wall distance (recommended for moving)
     target_inspection_distance: 1.5       # Target distance in meters (if adaptive disabled)
     depth_tolerance: 0.1                  # Tolerance in meters (±0.1m = ±10cm)

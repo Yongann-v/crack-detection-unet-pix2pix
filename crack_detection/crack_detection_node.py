@@ -3,7 +3,7 @@
 import os
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from std_msgs.msg import String, Bool, Int32
 from geometry_msgs.msg import Point, PoseWithCovarianceStamped
 from visualization_msgs.msg import Marker
@@ -50,6 +50,8 @@ class CrackDetectionNode(Node):
                 ('camera_topic', '/camera/color/image_raw'),
                 ('depth_topic', '/camera/depth/image'),
                 ('publish_visualization', True),
+                ('viz_scale', 0.5),          # Downscale published visualization (1.0 = full size)
+                ('use_fp16', True),          # Half-precision (autocast) inference on CUDA
                 # Zoom parameters
                 ('zoom_enabled', False),
                 ('zoom_factor', 2.0),
@@ -101,6 +103,8 @@ class CrackDetectionNode(Node):
         self.camera_topic = self.get_parameter('camera_topic').value
         self.depth_topic = self.get_parameter('depth_topic').value
         self.publish_visualization = self.get_parameter('publish_visualization').value
+        self.viz_scale = float(self.get_parameter('viz_scale').value)
+        self.use_fp16 = self.get_parameter('use_fp16').value
         
         # Get zoom parameters
         self.zoom_enabled = self.get_parameter('zoom_enabled').value
@@ -173,7 +177,9 @@ class CrackDetectionNode(Node):
         
         # Setup device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_fp16 = self.use_fp16 and self.device.type == 'cuda'
         self.get_logger().info(f'Device: {self.device}')
+        self.get_logger().info(f'FP16 inference: {self.use_fp16} | Visualization scale: {self.viz_scale}')
         
         # Determine mode and initialize appropriate models
         self.determine_and_initialize_mode()
@@ -208,11 +214,14 @@ class CrackDetectionNode(Node):
         self.detection_start_time = None
         
         # Create subscribers
+        # Queue depth 1: always process the newest frame, drop stale ones (low latency)
+        # Topics ending in /compressed carry sensor_msgs/CompressedImage (e.g. JPEG)
+        self.use_compressed = self.camera_topic.rstrip('/').endswith('/compressed')
         self.image_sub = self.create_subscription(
-            Image,
+            CompressedImage if self.use_compressed else Image,
             self.camera_topic,
             self.image_callback,
-            10
+            1
         )
         
         # Subscribe to depth topic
@@ -279,7 +288,13 @@ class CrackDetectionNode(Node):
             self.viz_pub = self.create_publisher(
                 Image,
                 '/crack_detection/visualization',
-                10
+                1
+            )
+            # JPEG copy: small enough for best-effort viewers like rqt_image_view
+            self.viz_compressed_pub = self.create_publisher(
+                CompressedImage,
+                '/crack_detection/visualization/compressed',
+                1
             )
         
         self.get_logger().info('✓ Initialization complete!')
@@ -688,12 +703,12 @@ class CrackDetectionNode(Node):
         input_tensor = transformed['image'].unsqueeze(0).to(self.device)
         
         # Predict
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=self.use_fp16):
             output = self.model(input_tensor)
             if isinstance(output, (tuple, list)):
                 output = output[0]
             
-            prediction = torch.sigmoid(output)
+            prediction = torch.sigmoid(output.float())
             
             # Resize back to original size
             pred_resized = torch.nn.functional.interpolate(
@@ -757,15 +772,15 @@ class CrackDetectionNode(Node):
         transformed = self.transforms(image=frame_rgb)
         input_tensor = transformed['image'].unsqueeze(0).to(self.device)
         
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.float16, enabled=self.use_fp16):
             # Stage 1: UNet prediction
             unet_output = self.model(input_tensor)
             if isinstance(unet_output, (tuple, list)):
                 unet_output = unet_output[0]
-            unet_pred = torch.sigmoid(unet_output)
+            unet_pred = torch.sigmoid(unet_output.float())
             
             # Stage 2: Pix2Pix residual refinement
-            residual = self.pix2pix(unet_pred)
+            residual = self.pix2pix(unet_pred).float()
             
             # Stage 3: Combine predictions
             refined_pred = torch.clamp(unet_pred + residual, 0, 1)
@@ -858,6 +873,15 @@ class CrackDetectionNode(Node):
             cv2.rectangle(original_frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
             cv2.putText(original_frame, f"Zoom: {self.zoom_factor:.1f}x", 
                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        
+        # Downscale everything up front so the stacked image stays small to build and send
+        if 0 < self.viz_scale < 1.0:
+            def scale(img, interp=cv2.INTER_AREA):
+                return cv2.resize(img, None, fx=self.viz_scale, fy=self.viz_scale, interpolation=interp)
+            original_frame = scale(original_frame)
+            frame_bgr = scale(frame_bgr)
+            pred_prob = scale(pred_prob)
+            binary_mask = scale(binary_mask, cv2.INTER_NEAREST)
         
         # Create heatmap
         heatmap = (pred_prob * 255).astype(np.uint8)
@@ -985,7 +1009,10 @@ class CrackDetectionNode(Node):
         
         # Convert ROS Image to OpenCV
         try:
-            frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if self.use_compressed:
+                frame_bgr = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            else:
+                frame_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().error(f'Failed to convert image: {e}')
             return
@@ -1131,16 +1158,23 @@ class CrackDetectionNode(Node):
                 self.marker_pub.publish(marker)
         
         # Publish visualization
-        if self.publish_visualization:
+        want_raw = self.publish_visualization and self.viz_pub.get_subscription_count() > 0
+        want_jpeg = self.publish_visualization and self.viz_compressed_pub.get_subscription_count() > 0
+        if want_raw or want_jpeg:
             viz_image = self.create_visualization(
                 zoomed_frame_bgr, pred_prob, binary_mask, crack_percentage, 
                 is_crack_detected, zoom_roi, temporal_status, depth_viz, self.current_wall_distance
             )
             
             try:
-                viz_msg = self.bridge.cv2_to_imgmsg(viz_image, encoding='bgr8')
-                viz_msg.header = msg.header
-                self.viz_pub.publish(viz_msg)
+                if want_raw:
+                    viz_msg = self.bridge.cv2_to_imgmsg(viz_image, encoding='bgr8')
+                    viz_msg.header = msg.header
+                    self.viz_pub.publish(viz_msg)
+                if want_jpeg:
+                    jpeg_msg = self.bridge.cv2_to_compressed_imgmsg(viz_image, dst_format='jpg')
+                    jpeg_msg.header = msg.header
+                    self.viz_compressed_pub.publish(jpeg_msg)
             except Exception as e:
                 self.get_logger().error(f'Failed to publish visualization: {e}')
 

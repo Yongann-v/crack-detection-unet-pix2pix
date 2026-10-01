@@ -61,7 +61,7 @@ def generate_launch_description():
     
     camera_topic_arg = DeclareLaunchArgument(
         'camera_topic',
-        default_value='/a200_1103/sensors/camera_0/color/image',
+        default_value='/insta360/front/image_raw',
         description='Camera image topic to subscribe to'
     )
     
@@ -137,7 +137,7 @@ def generate_launch_description():
     # Depth filtering arguments
     depth_filtering_enabled_arg = DeclareLaunchArgument(
         'depth_filtering_enabled',
-        default_value='true',  # Match YAML default
+        default_value='false',  # Match YAML default (Insta360 has no depth)
         description='Enable depth-based filtering to remove non-wall detections'
     )
     
