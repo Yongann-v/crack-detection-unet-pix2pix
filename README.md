@@ -206,7 +206,8 @@ Measured resource use in that setup (Insta360 compressed input, raw visualizatio
 | GPU utilization | ~37–39% |
 | GPU memory (detector) | ~520 MB |
 
-The node is CPU-bound (single Python process), not GPU-bound. To monitor:
+The node is CPU-bound (single Python process), not GPU-bound. See [docs/run_summary.md](docs/run_summary.md)
+for the full run summary (resolutions, frame rates, bandwidth). To monitor:
 
 ```bash
 watch -n1 nvidia-smi
