@@ -145,23 +145,43 @@ the whole stacked image and pixel coordinates refer to the 1920x1080 frame.
 
 ## **View Images with rqt_image_view**
 
-To inspect the visualization output:
+To open the visualization output directly:
 
 ```bash
-ros2 run rqt_image_view rqt_image_view
+ros2 run rqt_image_view rqt_image_view /crack_detection/visualization
 ```
 
-Then pick **`/crack_detection/visualization compressed`** from the topic dropdown.
+Or run `ros2 run rqt_image_view rqt_image_view` with no argument and pick a topic from the dropdown.
 
 The node publishes the visualization twice:
 
-- `/crack_detection/visualization/compressed` (JPEG, ~300 KB per frame): use this one. It runs smoothly in rqt.
-- `/crack_detection/visualization` (raw): large frames that best-effort subscribers like rqt mostly drop, so the view lags or freezes.
+| Topic | Size per frame | Notes |
+|---|---|---|
+| `/crack_detection/visualization` | ~5 MB (raw BGR) | Full quality, ~30 Hz. Needs the Fast DDS profile below. |
+| `/crack_detection/visualization/compressed` | ~200–300 KB (JPEG) | Lighter. Select **`/crack_detection/visualization (compressed)`** in the dropdown. |
 
-Do not pass `/crack_detection/visualization/compressed` on the rqt command line: rqt subscribes to it
+Do not pass a `.../compressed` topic on the rqt command line: rqt subscribes to it
 with the wrong message type and crashes. Select it from the dropdown instead.
+`camera_topic:=...` is a crack detection node argument, not an rqt one.
 
 The visualization is only built when something subscribes to one of these topics.
+
+### Fast DDS profile for the raw visualization
+
+Fast DDS's default shared-memory segment is 512 KB, so the ~5 MB raw frames get split into
+many fragments, and best-effort subscribers like rqt drop almost all of them (measured: ~1.7 Hz
+instead of 30 Hz). `crack_detection/config/fastdds_large_images.xml` raises the segment to 64 MB
+and keeps UDPv4, so topics from the robot over the network still work.
+
+- **With the launch file:** applied to the detector node automatically.
+- **With `ros2 run`:** export it in that terminal before starting the node:
+
+  ```bash
+  export FASTRTPS_DEFAULT_PROFILES_FILE=$(ros2 pkg prefix crack_detection)/share/crack_detection/config/fastdds_large_images.xml
+  ros2 run crack_detection crack_detection_node --ros-args -p camera_topic:=/insta360/image_raw/compressed
+  ```
+
+Only the publisher needs the profile. Viewers like rqt work without it.
 
 ---
 
@@ -176,6 +196,22 @@ Set in `crack_detection/config/crack_detection_params.yaml`:
 | `skip_frames` | `1` | Run inference on every Nth frame. |
 
 With the Insta360 compressed stream on an RTX 2000 Ada, the node keeps up with the camera at about 30 FPS.
+
+Measured resource use in that setup (Insta360 compressed input, raw visualization subscribed):
+
+| | Usage |
+|---|---|
+| `crack_detection_node` CPU | ~1.2 cores (~118%) |
+| `insta360_publisher` CPU | ~8% |
+| GPU utilization | ~37–39% |
+| GPU memory (detector) | ~520 MB |
+
+The node is CPU-bound (single Python process), not GPU-bound. To monitor:
+
+```bash
+watch -n1 nvidia-smi
+top -p $(pgrep -d, -f "crack_detection_node|insta360")
+```
 
 ---
 

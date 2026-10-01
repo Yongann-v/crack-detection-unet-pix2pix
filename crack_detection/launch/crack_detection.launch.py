@@ -15,7 +15,15 @@ def generate_launch_description():
         'config',
         'crack_detection_params.yaml'
     )
-    
+
+    # Fast DDS profile with a large shared-memory segment so the ~5 MB raw
+    # /crack_detection/visualization frames reach local subscribers
+    fastdds_profile = os.path.join(
+        get_package_share_directory('crack_detection'),
+        'config',
+        'fastdds_large_images.xml'
+    )
+
     # Declare launch arguments (these will OVERRIDE YAML values when specified)
     model_path_arg = DeclareLaunchArgument(
         'model_path',
@@ -165,6 +173,7 @@ def generate_launch_description():
         executable='crack_detection_node',
         name='crack_detection_node',
         output='screen',
+        additional_env={'FASTRTPS_DEFAULT_PROFILES_FILE': fastdds_profile},
         parameters=[
             config_file,  # Load YAML file FIRST (base configuration)
             {
