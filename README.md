@@ -83,13 +83,15 @@ ros2 launch realsense2_camera rs_launch.py
 ## **Launch Crack Detection Visualization in RViz**
 
 Start the crack detection visualization with namespace support and zoom settings.
-Depth filtering is off by default (the Insta360 has no depth camera), so turn it on for RealSense:
+Depth filtering is off by default (the Insta360 has no depth camera), so turn it on for RealSense.
+Insta360 lens undistortion is on by default, so turn it off for RealSense:
 
 ```bash
 ros2 launch crack_detection crack_detection.launch.py \
   camera_topic:=/camera/camera/color/image_raw \
   depth_topic:=/camera/camera/depth/image_rect_raw \
   depth_filtering_enabled:=true \
+  undistort_enabled:=false \
   zoom_enabled:=true \
   zoom_factor:=1.5
 ```
@@ -130,16 +132,77 @@ It publishes:
 
 ### Step 2 — Start crack detection
 
-The launch file defaults to the front lens (`/insta360/front/image_raw`). To use the compressed
-full frame instead (the node decodes the JPEG itself when the topic ends in `/compressed`):
+The launch file defaults to the front lens (`/insta360/front/image_raw`), undistorted with the
+front-lens calibration (see [Insta360 Lens Undistortion](#insta360-lens-undistortion)).
+
+Back lens:
+
+```bash
+ros2 launch crack_detection crack_detection.launch.py \
+  camera_topic:=/insta360/back/image_raw \
+  calibration_file:=calibration_data/insta360_oner_back.yaml
+```
+
+To use the compressed full frame instead (the node decodes the JPEG itself when the topic ends in `/compressed`):
 
 ```bash
 ros2 launch crack_detection crack_detection.launch.py \
   camera_topic:=/insta360/image_raw/compressed
 ```
 
-Note that the compressed full frame contains both lenses, so `min_crack_percent` applies to
-the whole stacked image and pixel coordinates refer to the 1920x1080 frame.
+With undistortion on (the default), the node crops the stacked frame to the calibrated lens
+before undistorting, so detection runs on that lens only. With `undistort_enabled:=false` the
+whole stacked frame is used: `min_crack_percent` then applies to both lenses together and pixel
+coordinates refer to the 1920x1080 frame.
+
+---
+
+## **Insta360 Lens Undistortion**
+
+In webcam mode the Insta360 ONE R sends both lenses as two 1920x540 strips (back lens on top,
+front lens on the bottom). The firmware partly flattens them, but barrel distortion remains,
+so cracks near the left and right edges look bent. The detection node removes it with a
+per-lens fisheye calibration before zoom and inference, so masks, crack percentage and crack
+centers are all in undistorted image coordinates.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `undistort_enabled` | `true` | Undistort frames before inference. Set `false` for RealSense or other cameras. |
+| `calibration_file` | `calibration_data/insta360_oner_front.yaml` | Lens calibration (relative to the package share directory). |
+| `undistort_balance` | `0.5` | `0` crops to valid pixels (loses ~40% of the view), `1` keeps the full view with large black corners. |
+
+Calibrations in `crack_detection/calibration_data/` (9x6 board, 20 mm squares, fisheye model):
+
+| Lens | File | Reprojection error | Images |
+|---|---|---|---|
+| Front | `insta360_oner_front.yaml` | 0.32 px | 79 |
+| Back | `insta360_oner_back.yaml` | 0.195 px | 82 |
+
+Undistortion costs about 0.45 ms per frame, and the node still runs at about 30 Hz in UNet fast mode.
+If the frame size does not match the calibration, the node logs an error and skips the frame.
+
+### Recalibrate a lens
+
+Stop `insta360_publisher` first (the capture tool opens `/dev/video0` directly).
+
+```bash
+# 1. Print a checkerboard at 100% scale and measure one square
+ros2 run crack_detection capture_calibration --make-board checkerboard.png --board 9x6 --square-mm 20
+
+# 2. Capture 40+ images (space = save, a = auto-save, q = quit). Cover the corners and edges.
+#    PYTHONNOUSERSITE=1 is needed if pip's opencv-python-headless is installed in ~/.local
+PYTHONNOUSERSITE=1 ros2 run crack_detection capture_calibration --lens front --board 9x6
+
+# 3. Calibrate (writes the YAML and a before/after preview image)
+ros2 run crack_detection calibrate_insta360 --images calib_images/front --lens front \
+  --board 9x6 --square-mm 20 --out src/crack-detection-unet-pix2pix/crack_detection/calibration_data
+
+# 4. Rebuild so the new calibration is installed
+colcon build --packages-select crack_detection --symlink-install
+```
+
+Aim for a reprojection error under 0.5 px. Tests for the undistorter are in
+`Agent_md/test_undistortion_template.py` (`python3 -m pytest Agent_md/test_undistortion_template.py -v`).
 
 ---
 
