@@ -1,0 +1,25 @@
+%YAML:1.0
+---
+model: fisheye
+lens: back
+image_width: 1920
+image_height: 540
+K: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 635.45275917708511, 0., 928.04052335331596, 0.,
+       696.43796296973085, 301.68784284579772, 0., 0., 1. ]
+D: !!opencv-matrix
+   rows: 4
+   cols: 1
+   dt: d
+   data: [ 0.17207576024595345, -0.12066600252045795,
+       0.091785431884784163, -0.021711296423039515 ]
+rms_px: 0.19503662923343057
+num_images: 82
+board: "9x6"
+square_mm: 20.
+date: "2026-10-07T16:01:18"
+rms_fisheye_px: 0.19503662923343057
+rms_rational_px: 0.90567352649036514

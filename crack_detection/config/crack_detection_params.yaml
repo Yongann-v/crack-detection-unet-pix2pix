@@ -52,3 +52,8 @@ crack_detection_node:
     use_adaptive_depth: true              # Auto-adapt to wall distance (recommended for moving)
     target_inspection_distance: 1.5       # Target distance in meters (if adaptive disabled)
     depth_tolerance: 0.1                  # Tolerance in meters (±0.1m = ±10cm)
+    
+    # Insta360 lens undistortion (calibrate with capture_calibration + calibrate_insta360)
+    undistort_enabled: true               # Undistort frames before inference (Insta360 only)
+    calibration_file: "calibration_data/insta360_oner_front.yaml"
+    undistort_balance: 0.5                # 0 = crop to valid pixels, 1 = keep full field of view

@@ -25,6 +25,8 @@ from crack_detection.unet_model import UNet
 from crack_detection.train_pix2pix import Generator
 from crack_detection.unet_rt_inference_tiling6 import TiledUNetInference
 from crack_detection.pix2pix_rt_inference_tiling import TiledRefinedInference
+from crack_detection.undistort import Insta360Undistorter
+from crack_detection.insta360_lens import crop_lens
 
 
 class CrackDetectionNode(Node):
@@ -72,6 +74,10 @@ class CrackDetectionNode(Node):
                 ('use_adaptive_depth', True),
                 ('target_inspection_distance', 1.5),
                 ('depth_tolerance', 0.1),
+                # Insta360 lens undistortion parameters
+                ('undistort_enabled', False),
+                ('calibration_file', 'calibration_data/insta360_oner_front.yaml'),
+                ('undistort_balance', 0.5),  # 0 = crop to valid pixels, 1 = keep full field of view
             ]
         )
         
@@ -131,6 +137,20 @@ class CrackDetectionNode(Node):
         self.target_inspection_distance = self.get_parameter('target_inspection_distance').value
         self.depth_tolerance = self.get_parameter('depth_tolerance').value
         
+        # Get undistortion parameters
+        self.undistort_enabled = self.get_parameter('undistort_enabled').value
+        calibration_file_param = self.get_parameter('calibration_file').value
+        if not os.path.isabs(calibration_file_param):
+            package_share = get_package_share_directory('crack_detection')
+            self.calibration_file = os.path.join(package_share, calibration_file_param)
+        else:
+            self.calibration_file = calibration_file_param
+        self.undistort_balance = float(self.get_parameter('undistort_balance').value)
+        self.undistorter = None
+        if self.undistort_enabled:
+            self.undistorter = Insta360Undistorter.from_file(
+                self.calibration_file, balance=self.undistort_balance)
+        
         # Create save directory if it doesn't exist
         if not os.path.isabs(self.save_directory):
             self.save_directory = os.path.join(os.getcwd(), self.save_directory)
@@ -157,6 +177,12 @@ class CrackDetectionNode(Node):
             self.get_logger().info(f'Hysteresis enabled: Low threshold={self.hysteresis_low_threshold}%, Min duration={self.hysteresis_min_duration}s')
         else:
             self.get_logger().info('Hysteresis disabled')
+        if self.undistorter is not None:
+            self.get_logger().info(
+                f'Undistortion enabled: {self.undistorter.lens} lens, {self.undistorter.model} model, '
+                f'balance={self.undistort_balance}, calibration={self.calibration_file}')
+        else:
+            self.get_logger().info('Undistortion disabled')
         
         # Log depth filtering settings
         if self.depth_filtering_enabled:
@@ -1016,6 +1042,20 @@ class CrackDetectionNode(Node):
         except Exception as e:
             self.get_logger().error(f'Failed to convert image: {e}')
             return
+        
+        # Undistort before zoom and inference so masks and crack centers are in undistorted coordinates
+        if self.undistorter is not None:
+            calib_w, calib_h = self.undistorter.image_size
+            if frame_bgr.shape[:2] == (2 * calib_h, calib_w):
+                # Full stacked dual-lens frame (e.g. /insta360/image_raw/compressed): keep the calibrated lens
+                frame_bgr = crop_lens(frame_bgr, self.undistorter.lens)
+            if frame_bgr.shape[:2] != (calib_h, calib_w):
+                self.get_logger().error(
+                    f'Frame is {frame_bgr.shape[1]}x{frame_bgr.shape[0]} but calibration is '
+                    f'{calib_w}x{calib_h}; set undistort_enabled:=false for this camera',
+                    throttle_duration_sec=5.0)
+                return
+            frame_bgr = self.undistorter.undistort_frame(frame_bgr)
         
         # Store original frame for saving and visualization
         self.last_original_frame = frame_bgr.copy()

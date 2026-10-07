@@ -167,6 +167,25 @@ def generate_launch_description():
         description='Depth tolerance in meters (±tolerance around target distance)'
     )
     
+    # Undistortion arguments
+    undistort_enabled_arg = DeclareLaunchArgument(
+        'undistort_enabled',
+        default_value='true',  # Match YAML default (Insta360 front lens)
+        description='Undistort Insta360 frames before inference (set false for RealSense)'
+    )
+    
+    calibration_file_arg = DeclareLaunchArgument(
+        'calibration_file',
+        default_value='calibration_data/insta360_oner_front.yaml',
+        description='Lens calibration from calibrate_insta360 (relative to package share)'
+    )
+    
+    undistort_balance_arg = DeclareLaunchArgument(
+        'undistort_balance',
+        default_value='0.5',
+        description='0 = crop to valid pixels, 1 = keep full field of view'
+    )
+    
     # Create the crack detection node
     crack_detection_node = Node(
         package='crack_detection',
@@ -210,6 +229,10 @@ def generate_launch_description():
                 'use_adaptive_depth': LaunchConfiguration('use_adaptive_depth'),
                 'target_inspection_distance': LaunchConfiguration('target_inspection_distance'),
                 'depth_tolerance': LaunchConfiguration('depth_tolerance'),
+                # Undistortion parameters
+                'undistort_enabled': LaunchConfiguration('undistort_enabled'),
+                'calibration_file': LaunchConfiguration('calibration_file'),
+                'undistort_balance': LaunchConfiguration('undistort_balance'),
             }
         ]
     )
@@ -238,5 +261,8 @@ def generate_launch_description():
         use_adaptive_depth_arg,
         target_inspection_distance_arg,
         depth_tolerance_arg,
+        undistort_enabled_arg,
+        calibration_file_arg,
+        undistort_balance_arg,
         crack_detection_node
     ])

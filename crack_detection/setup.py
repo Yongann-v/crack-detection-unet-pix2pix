@@ -15,6 +15,7 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml') + glob('config/*.xml')),
         (os.path.join('share', package_name, 'models'), glob('models/*.pth')),
+        (os.path.join('share', package_name, 'calibration_data'), glob('calibration_data/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -26,6 +27,8 @@ setup(
     entry_points={
         'console_scripts': [
             'crack_detection_node = crack_detection.crack_detection_node:main',
+            'capture_calibration = crack_detection.capture_calibration:main',
+            'calibrate_insta360 = crack_detection.calibrate_insta360:main',
         ],
     },
 )
